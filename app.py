@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import librosa
 import soundfile as sf
 import numpy as np
@@ -29,10 +29,15 @@ def process_audio():
     # Concatenate only non-silent parts
     y_processed = np.concatenate([y[start:end] for start, end in non_silent_intervals])
 
-    # Save processed audio
-    sf.write(output_path, y_processed, sr)
+    # 🔁 Make it loop smoothly (repeat the snore several times)
+    num_loops = 10  # you can adjust this number for longer loops
+    y_looped = np.tile(y_processed, num_loops)
 
-    return jsonify({"message": "Processing complete", "output_file": output_path})
+    # Save processed audio
+    sf.write(output_path, y_looped, sr)
+
+    # Return processed file
+    return send_file(output_path, as_attachment=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

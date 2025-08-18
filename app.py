@@ -6,140 +6,204 @@ import os
 
 app = Flask(__name__)
 
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_bool(s, default=False):
+    if s is None:
+        return default
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+def parse_float(s, default):
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+def rms_linear(x):
+    return np.sqrt(np.mean(np.square(x))) + 1e-12  # avoid div-by-zero
+
+def normalize_to_target_rms(y, target_dbfs=-20.0):
+    """
+    Normalize a signal 'y' so its RMS ~= target_dbfs (e.g. -20 dBFS).
+    0 dBFS means full-scale (|y|=1). -20 dBFS ~ 0.1 RMS.
+    """
+    target_lin = 10.0 ** (target_dbfs / 20.0)
+    cur_rms = rms_linear(y)
+    y_out = y * (target_lin / cur_rms)
+    # hard clip to avoid intersample peaks after gains
+    return np.clip(y_out, -1.0, 1.0)
+
+def linear_fade_in(n):
+    return np.linspace(0.0, 1.0, num=n, endpoint=True)
+
+def linear_fade_out(n):
+    return np.linspace(1.0, 0.0, num=n, endpoint=True)
+
+def crossfade_concat(segments, sr, xf_ms=50):
+    """
+    Concatenate segments with linear crossfades.
+    xf_ms: crossfade length in milliseconds.
+    """
+    if len(segments) == 0:
+        return np.array([], dtype=np.float32)
+    if len(segments) == 1:
+        return segments[0].astype(np.float32)
+
+    xf_samps = max(1, int(sr * (xf_ms / 1000.0)))
+    out = segments[0].astype(np.float32)
+
+    for idx in range(1, len(segments)):
+        a = out
+        b = segments[idx].astype(np.float32)
+
+        if len(a) < xf_samps or len(b) < xf_samps:
+            # If a segment is very short, just butt-join
+            out = np.concatenate([a, b])
+            continue
+
+        # overlap last xf_samps of a with first xf_samps of b
+        a_head = a[:-xf_samps]
+        a_tail = a[-xf_samps:]
+        b_head = b[:xf_samps]
+        b_tail = b[xf_samps:]
+
+        fadeA = linear_fade_out(xf_samps).astype(np.float32)
+        fadeB = linear_fade_in(xf_samps).astype(np.float32)
+
+        cross = (a_tail * fadeA) + (b_head * fadeB)
+        out = np.concatenate([a_head, cross, b_tail])
+
+    return out
+
+def detect_non_silent_segments(y, top_db=20):
+    """
+    Return list of time-domain segments for non-silent portions.
+    """
+    intervals = librosa.effects.split(y, top_db=top_db)
+    if len(intervals) == 0:
+        return [y]
+    return [y[s:e] for (s, e) in intervals]
+
+def build_loop(y, sr, target_sec=30, xf_ms=50, top_db=20, normalize=True, target_dbfs=-20.0):
+    """
+    Your original 'loop' idea:
+      - Grab non-silent pieces
+      - (optional) normalize each piece to same loudness
+      - crossfade join them
+      - tile to fill target length, then trim
+    """
+    segs = detect_non_silent_segments(y, top_db=top_db)
+    if normalize:
+        segs = [normalize_to_target_rms(s, target_dbfs) for s in segs]
+
+    joined = crossfade_concat(segs, sr, xf_ms=xf_ms)
+
+    # tile to reach target length
+    target_samples = int(sr * target_sec)
+    if len(joined) == 0:
+        return np.zeros(target_samples, dtype=np.float32)
+
+    reps = max(1, int(np.ceil(target_samples / len(joined))))
+    looped = np.tile(joined, reps).astype(np.float32)
+    looped = looped[:target_samples]
+
+    return looped
+
+def build_blend(y, sr, target_sec=30, xf_ms=50, top_db=20, normalize=True, target_dbfs=-20.0):
+    """
+    'Strongest snore blend':
+      - take non-silent snore intervals
+      - normalize all intervals to the same RMS to remove dips
+      - sort by loudness (RMS) so the “strong” character dominates
+      - crossfade join them
+      - tile + trim to target_sec
+    This makes a steady, full sound without obvious level dips.
+    """
+    segs = detect_non_silent_segments(y, top_db=top_db)
+
+    if len(segs) == 0:
+        target_samples = int(sr * target_sec)
+        return np.zeros(target_samples, dtype=np.float32)
+
+    # Normalize every interval so they sit at the same loudness
+    if normalize:
+        segs = [normalize_to_target_rms(s, target_dbfs) for s in segs]
+
+    # Sort by their RMS (descending): densest/strongest intervals first
+    segs = sorted(segs, key=lambda s: rms_linear(s), reverse=True)
+
+    # Crossfade-join once, then tile to target length
+    base = crossfade_concat(segs, sr, xf_ms=xf_ms)
+
+    target_samples = int(sr * target_sec)
+    if len(base) == 0:
+        return np.zeros(target_samples, dtype=np.float32)
+
+    reps = max(1, int(np.ceil(target_samples / len(base))))
+    strong = np.tile(base, reps).astype(np.float32)
+    strong = strong[:target_samples]
+
+    # Safety normalize the final output a little (prevent minor overs)
+    peak = np.max(np.abs(strong)) + 1e-12
+    if peak > 1.0:
+        strong = strong / peak
+
+    return strong
+
+# -----------------------------
+# Routes
+# -----------------------------
 @app.route('/')
 def home():
     return "SnoreEase processor is running"
 
-# ---------- helpers ----------
-
-def rms(x: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.square(x), dtype=np.float64) + 1e-12))
-
-def normalize_to_target(x: np.ndarray, target_rms: float) -> np.ndarray:
-    cur = rms(x)
-    if cur <= 0:
-        return x
-    g = target_rms / cur
-    y = x * g
-    # avoid clipping
-    y = np.clip(y, -1.0, 1.0)
-    return y
-
-def crossfade_concat(segments, fade_samples: int) -> np.ndarray:
-    """Concatenate segments with linear crossfades."""
-    if not segments:
-        return np.array([], dtype=np.float32)
-    out = segments[0].astype(np.float32).copy()
-    for seg in segments[1:]:
-        seg = seg.astype(np.float32)
-        if fade_samples > 0 and len(out) > 0 and len(seg) > 0:
-            n = min(fade_samples, len(out), len(seg))
-            if n > 0:
-                w = np.linspace(0.0, 1.0, n, dtype=np.float32)
-                out[-n:] = out[-n:] * (1.0 - w) + seg[:n] * w
-                out = np.concatenate([out, seg[n:]])
-            else:
-                out = np.concatenate([out, seg])
-        else:
-            out = np.concatenate([out, seg])
-    return out
-
-def loop_to_length(y: np.ndarray, sr: int, target_sec: float, crossfade_ms: int) -> np.ndarray:
-    """Repeat y with crossfades to reach target_sec; trims to exact length."""
-    if target_sec is None or target_sec <= 0:
-        return y
-    target_len = int(target_sec * sr)
-    if len(y) >= target_len:
-        return y[:target_len]
-
-    fade = int(sr * (crossfade_ms / 1000.0))
-    pieces = [y]
-    # how many repeats (subtract a fade to keep size growth reasonable)
-    unit = max(1, len(y) - fade)
-    repeats = int(np.ceil((target_len - len(y)) / unit)) + 1
-    for _ in range(repeats - 1):
-        pieces.append(y)
-
-    out = pieces[0].astype(np.float32).copy()
-    for seg in pieces[1:]:
-        n = min(fade, len(out), len(seg))
-        if n > 0:
-            w = np.linspace(0.0, 1.0, n, dtype=np.float32)
-            out[-n:] = out[-n:] * (1.0 - w) + seg[:n] * w
-            out = np.concatenate([out, seg[n:].astype(np.float32)])
-        else:
-            out = np.concatenate([out, seg.astype(np.float32)])
-    return out[:target_len]
-
-# ---------- main processing ----------
-
 @app.route('/process', methods=['POST'])
 def process_audio():
+    # Validate upload
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
-    file = request.files['file']
-
-    # Optional tweakable params (sent as form fields)
-    # Silence removal
-    top_db = int(request.form.get('top_db', 20))            # higher => more aggressive silence removal
-    frame_length = int(request.form.get('frame_length', 2048))
-    hop_length = int(request.form.get('hop_length', 512))
-
-    # Normalization / crossfades
-    normalize = request.form.get('normalize', '1') not in ['0', 'false', 'False']
-    inter_fade_ms = int(request.form.get('inter_fade_ms', 30))   # crossfade between bursts (ms)
-
-    # Loop controls
-    target_sec = request.form.get('target_sec', None)
-    target_sec = float(target_sec) if target_sec is not None else None
-    loop_fade_ms = int(request.form.get('loop_fade_ms', 50))     # crossfade between loop copies (ms)
-
-    # Save input to disk
+    f = request.files['file']
     input_path = "input.wav"
     output_path = "output.wav"
-    file.save(input_path)
+    f.save(input_path)
 
-    # Load mono (keep native sample rate)
+    # Parameters (all optional)
+    mode = request.form.get("mode", "loop").strip().lower()  # "loop" or "blend"
+    target_sec = parse_float(request.form.get("target_sec"), 30.0)
+    xf_ms = parse_float(request.form.get("xf_ms"), 50.0)            # crossfade ms
+    top_db = parse_float(request.form.get("top_db"), 20.0)           # silence threshold
+    normalize = parse_bool(request.form.get("normalize"), True)      # level each piece
+    target_dbfs = parse_float(request.form.get("target_dbfs"), -20.0)  # RMS target
+
+    # Load mono at native sampling rate
     y, sr = librosa.load(input_path, sr=None, mono=True)
 
-    # Find non-silent intervals
-    intervals = librosa.effects.split(
-        y, top_db=top_db, frame_length=frame_length, hop_length=hop_length
-    )
-
-    if intervals.size == 0:
-        # no detected audio, return original file
-        sf.write(output_path, y, sr)
-        return send_file(output_path, as_attachment=True)
-
-    # Collect bursts and (optionally) normalize each to a common RMS
-    bursts = []
-    if normalize:
-        rms_vals = []
-        for start, end in intervals:
-            seg = y[start:end]
-            if len(seg) > 0:
-                rms_vals.append(rms(seg))
-        target = float(np.median(rms_vals)) if len(rms_vals) > 0 else rms(y)
-
-        for start, end in intervals:
-            seg = y[start:end]
-            seg = normalize_to_target(seg, target)
-            bursts.append(seg)
+    if mode == "blend":
+        y_out = build_blend(
+            y, sr,
+            target_sec=target_sec,
+            xf_ms=xf_ms,
+            top_db=top_db,
+            normalize=normalize,
+            target_dbfs=target_dbfs
+        )
     else:
-        for start, end in intervals:
-            bursts.append(y[start:end])
+        # default = loop
+        y_out = build_loop(
+            y, sr,
+            target_sec=target_sec,
+            xf_ms=xf_ms,
+            top_db=top_db,
+            normalize=normalize,
+            target_dbfs=target_dbfs
+        )
 
-    # Crossfade between bursts to reduce dips between snore intervals
-    inter_fade = int(sr * (inter_fade_ms / 1000.0))
-    y_processed = crossfade_concat(bursts, inter_fade)
+    # Write WAV
+    sf.write(output_path, y_out, sr)
 
-    # Build a long loop if requested
-    y_looped = loop_to_length(y_processed, sr, target_sec, loop_fade_ms)
-
-    # Save & return
-    sf.write(output_path, y_looped if target_sec else y_processed, sr)
+    # Return the file as an attachment
     return send_file(output_path, as_attachment=True)
 
 if __name__ == '__main__':

@@ -4,305 +4,218 @@ import io
 import numpy as np
 import soundfile as sf
 import librosa
+from scipy.signal import fftconvolve
 
 app = Flask(__name__)
 
-# ----------------------------- #
-# Helpers                       #
-# ----------------------------- #
+# ---------------------------
+# Helpers
+# ---------------------------
 
-def parse_bool(v, default=False):
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+def db_to_gain(db):
+    return 10.0 ** (db / 20.0)
 
-def parse_float(v, default):
-    try:
-        return float(v)
-    except Exception:
-        return default
+def gain_to_db(g):
+    g = np.maximum(1e-12, np.abs(g))
+    return 20.0 * np.log10(g)
 
-def parse_int(v, default):
-    try:
-        return int(v)
-    except Exception:
-        return default
+def normalise_to_dbfs(y, target_dbfs=-18.0):
+    peak = np.max(np.abs(y)) + 1e-12
+    current_dbfs = gain_to_db(peak)
+    diff = target_dbfs - current_dbfs
+    return y * db_to_gain(diff)
 
-def normalize_to_dbfs(y, target_dbfs=-18.0, eps=1e-12):
-    """
-    Loudness-normalize to target dBFS by matching RMS.
-    """
-    rms = np.sqrt(np.mean(np.square(y)) + eps)
-    ref_amp = 10.0 ** (target_dbfs / 20.0)
-    if rms < eps:
-        return y
-    gain = ref_amp / rms
-    y2 = y * gain
-    # prevent accidental clipping
-    mx = np.max(np.abs(y2)) + eps
-    if mx > 1.0:
-        y2 = y2 / mx
-    return y2
+def detect_intervals(y, sr, top_db=24):
+    # Keep “non-silent” parts; high top_db = more lenient (keeps more tails)
+    intervals = librosa.effects.split(y, top_db=top_db)
+    return intervals
 
-def band_limits_to_bin(bass_hz, sr, n_fft):
-    """
-    Return bin index that corresponds to bass_hz cutoff.
-    """
-    if bass_hz <= 0:
-        return 0
-    return int(np.clip(np.round(bass_hz * n_fft / sr), 0, n_fft // 2))
-
-def xf_crossfade(a, b, xf_ms, sr):
-    """
-    Crossfade tail of a into head of b with linear window.
-    """
-    xf = int(sr * (xf_ms / 1000.0))
-    if xf <= 0:
-        return np.concatenate([a, b], axis=0)
-    n_a = len(a)
-    n_b = len(b)
-    xf = min(xf, n_a, n_b)
-    if xf <= 0:
-        return np.concatenate([a, b], axis=0)
-
-    fade_out = np.linspace(1.0, 0.0, xf, dtype=np.float32)
-    fade_in  = 1.0 - fade_out
-    x_tail = a[-xf:] * fade_out
-    y_head = b[:xf]  * fade_in
-    mid = x_tail + y_head
-    return np.concatenate([a[:-xf], mid, b[xf:]], axis=0)
-
-def concatenate_with_crossfades(chunks, xf_ms, sr):
-    """
-    Concatenate chunks with crossfades between each pair.
-    """
-    if len(chunks) == 0:
+def concat_intervals(y, intervals):
+    if len(intervals) == 0:
         return np.zeros(1, dtype=np.float32)
-    out = chunks[0]
-    for c in chunks[1:]:
-        out = xf_crossfade(out, c, xf_ms=xf_ms, sr=sr)
-    return out
+    parts = [y[s:e] for s, e in intervals]
+    out = np.concatenate(parts)
+    return out.astype(np.float32, copy=False)
 
-def gate_quiet(y, sr, gate_db=-38.0, frame_ms=30):
+def build_coloured_noise_like(y, sr, secs=None):
     """
-    Downward expander style gating: zero out very quiet tails/heads.
+    Create coloured noise with the average magnitude spectrum of y.
     """
-    frame = max(32, int(sr * frame_ms / 1000.0))
-    hop = max(16, frame // 2)
-    win = np.hanning(frame + 2)[1:-1]
-    th = 10.0 ** (gate_db / 20.0)
-
-    out = y.copy()
-    for i in range(0, len(y) - frame, hop):
-        seg = y[i:i+frame]
-        rms = np.sqrt(np.mean(seg*seg) + 1e-12)
-        if rms < th:
-            out[i:i+frame] = 0.0 * win  # soft zero
-    return out
-
-def trim_silence_segments(y, sr, top_db=24, xf_ms=120):
-    """
-    Keep only non-silent parts and re-join with crossfades.
-    """
-    intervals = librosa.effects.split(y, top_db=float(top_db), frame_length=2048, hop_length=512)
-    chunks = [y[s:e] for (s, e) in intervals]
-    if len(chunks) == 0:
-        return np.zeros(1, dtype=np.float32)
-    return concatenate_with_crossfades(chunks, xf_ms=xf_ms, sr=sr)
-
-def spectral_hold_sustain(y, sr, sustain_alpha=0.7, bass_hz=180.0):
-    """
-    Sustain/morph-like processing, but keep bass from the original
-    to avoid 'thin' sound; apply exponential temporal hold on magnitude.
-    sustain_alpha in [0..1]: closer to 1 = stronger sustaining (flatter troughs).
-    """
-    # STFT
-    n_fft = 2048
-    hop = 512
-    win = "hann"
-    S = librosa.stft(y, n_fft=n_fft, hop_length=hop, window=win)
-    mag, phase = np.abs(S), np.angle(S)
-
-    # temporal exponential hold on magnitude (per-bin EMA of the max-like envelope)
-    # H[t,f] = max(H[t-1,f]*alpha, mag[t,f])
-    H = np.zeros_like(mag)
-    alpha = float(np.clip(sustain_alpha, 0.0, 0.999))
-    for t in range(mag.shape[1]):
-        if t == 0:
-            H[:, t] = mag[:, t]
-        else:
-            H[:, t] = np.maximum(H[:, t-1] * alpha, mag[:, t])
-
-    # Preserve low-frequency region from the original to keep body/bass.
-    cutbin = band_limits_to_bin(bass_hz, sr=sr, n_fft=n_fft)
-    if cutbin > 0:
-        H_low  = mag[:cutbin, :]
-        H[:cutbin, :] = 0.75 * H[:cutbin, :] + 0.25 * H_low  # gentle blend
-
-    # Reconstruct
-    S_new = H * np.exp(1j * phase)
-    y_out = librosa.istft(S_new, hop_length=hop, window=win, length=len(y))
-    return y_out.astype(np.float32)
-
-# ----------------------------- #
-# Processing modes              #
-# ----------------------------- #
-
-def process_blend(y, sr, params):
-    top_db       = parse_float(params.get("top_db"), 24.0)
-    xf_ms        = parse_float(params.get("xf_ms"), 120.0)
-    inter_fade   = parse_float(params.get("inter_fade_ms"), 0.0)
-    target_sec   = parse_float(params.get("target_sec"), 120.0)
-
-    y1 = trim_silence_segments(y, sr, top_db=top_db, xf_ms=xf_ms)
-
-    # optional inter-segment smoothing
-    if inter_fade > 0:
-        y1 = xf_crossfade(y1[:], y1[:], xf_ms=inter_fade, sr=sr)[:len(y1)]
-
-    # fit/loop to target duration
-    target_len = int(sr * target_sec)
-    if len(y1) < target_len:
-        reps = int(np.ceil(target_len / max(1, len(y1))))
-        y1 = np.tile(y1, reps)
-    y1 = y1[:target_len]
-    return y1
-
-def process_morph(y, sr, params):
-    """
-    Earlier 'morph' (spectral sustain + light compression).
-    """
-    morph_alpha  = parse_float(params.get("morph_alpha"), 0.7)
-    target_sec   = parse_float(params.get("target_sec"), 120.0)
-    comp_thresh  = parse_float(params.get("comp_thresh_db"), -24.0)
-    comp_ratio   = parse_float(params.get("comp_ratio"), 3.0)
-
-    y2 = spectral_hold_sustain(y, sr, sustain_alpha=morph_alpha, bass_hz=140.0)
-
-    # simple soft-knee-ish compression
-    thr = 10 ** (comp_thresh / 20.0)
-    x = y2.copy()
-    above = np.abs(x) > thr
-    x[above] = np.sign(x[above]) * (thr + (np.abs(x[above]) - thr) / max(1e-6, comp_ratio))
-    y2 = x
-
-    target_len = int(sr * target_sec)
-    if len(y2) < target_len:
-        reps = int(np.ceil(target_len / max(1, len(y2))))
-        y2 = np.tile(y2, reps)
-    y2 = y2[:target_len]
-    return y2
-
-def process_sustain(y, sr, params):
-    """
-    New 'sustain' mode: stronger temporal hold + bass preservation
-    + gating of very quiet tails + crossfades around joins.
-    """
-    sustain_alpha = parse_float(params.get("sustain_alpha"), 0.85)   # stronger by default
-    bass_hz       = parse_float(params.get("bass_hz"), 180.0)
-    gate_db       = parse_float(params.get("gate_db"), -38.0)
-    target_sec    = parse_float(params.get("target_sec"), 120.0)
-    xf_ms         = parse_float(params.get("xf_ms"), 500.0)          # generous crossfade
-    inter_fade    = parse_float(params.get("inter_fade_ms"), 300.0)
-
-    # Gate quiet tails first (skip wispy breaks)
-    y_gated = gate_quiet(y, sr, gate_db=gate_db, frame_ms=30)
-
-    # Spectral sustain with bass preservation
-    y_sus = spectral_hold_sustain(y_gated, sr, sustain_alpha=sustain_alpha, bass_hz=bass_hz)
-
-    # Re-join with itself (gentle 'glue' around joins) if requested
-    if inter_fade > 0:
-        y_sus = xf_crossfade(y_sus, y_sus, xf_ms=inter_fade, sr=sr)[:len(y_sus)]
-
-    # Fit to target with long crossfades to hide joins
-    target_len = int(sr * target_sec)
-    if len(y_sus) < target_len:
-        # tile with crossfades instead of blunt concatenation
-        parts = []
-        remain = target_len
-        cur = y_sus
-        while remain > 0:
-            need = min(remain, len(cur))
-            parts.append(cur[:need])
-            remain -= need
-            if remain > 0:
-                cur = xf_crossfade(cur, y_sus, xf_ms=xf_ms, sr=sr)
-        y_out = concatenate_with_crossfades(parts, xf_ms=xf_ms, sr=sr)
+    if secs is None:
+        N = y.size
     else:
-        y_out = y_sus[:target_len]
+        N = int(secs * sr)
+    # average spectrum
+    n_fft = 1024
+    hop = n_fft // 4
+    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))  # (freq, frames)
+    mean_mag = np.mean(S, axis=1) + 1e-12
+    # white noise -> STFT -> apply mean_mag -> iSTFT
+    w = np.random.randn(N).astype(np.float32)
+    W = librosa.stft(w, n_fft=n_fft, hop_length=hop)
+    phase = np.exp(1j * np.angle(W))
+    # normalise each frame then apply target spectrum
+    W_mag = np.abs(W) + 1e-12
+    W_col = phase * (W / W_mag)  # unit-mag with original phase
+    # scale rows to match mean_mag
+    scale = (mean_mag / np.mean(W_mag, axis=1, keepdims=False)).reshape(-1, 1)
+    W_col = np.abs(W_col) * scale * phase
+    z = librosa.istft(W_col, hop_length=hop, length=N)
+    return z.astype(np.float32, copy=False)
 
-    return y_out
+def loop_to_seconds(y, sr, target_sec=120, xf_ms=300, inter_fade_ms=300):
+    """
+    Tile y to target_sec with crossfades to hide seams.
+    """
+    if y.size == 0:
+        return y
+    xf = int(xf_ms * sr / 1000)
+    inter = int(inter_fade_ms * sr / 1000)
+    target_len = int(target_sec * sr)
+    chunks = []
+    cur = 0
+    first = True
+    while cur < target_len:
+        take = min(y.size, target_len - cur)
+        seg = y[:take].copy()
+        if not first and xf > 0 and len(chunks) > 0:
+            # crossfade with previous end
+            prev = chunks[-1]
+            L = min(xf, seg.size, prev.size)
+            win = np.linspace(0, 1, L, dtype=np.float32)
+            prev[-L:] = prev[-L:] * (1 - win) + seg[:L] * win
+            seg = seg[L:]
+            chunks[-1] = prev
+        chunks.append(seg)
+        # small inter-fade dip between repeats (optional)
+        if inter > 0 and (cur + take) < target_len:
+            pad = np.zeros(min(inter, target_len - (cur + take)), dtype=np.float32)
+            chunks.append(pad)
+        cur += take + (0 if inter <= 0 else min(inter, target_len - (cur + take)))
+        first = False
+    out = np.concatenate(chunks) if len(chunks) else y
+    return out
 
-# ----------------------------- #
-# Flask routes                  #
-# ----------------------------- #
+def apply_reverb(y, sr, reverb_ms=200.0, decay=0.35, mix=0.2):
+    """
+    Very light exponential IR reverb. mix in [0..1]
+    """
+    reverb_ms = max(0.0, float(reverb_ms))
+    mix = float(np.clip(mix, 0.0, 1.0))
+    if reverb_ms <= 1 or mix <= 0:
+        return y
+    ir_len = int(sr * reverb_ms / 1000.0)
+    t = np.arange(ir_len, dtype=np.float32)
+    ir = (decay ** (t / (ir_len + 1.0))).astype(np.float32)
+    ir[0] = 1.0  # direct
+    wet = fftconvolve(y, ir, mode="full")[: y.size]
+    return (1 - mix) * y + mix * wet
 
-@app.route("/")
+# ---------------------------
+# Core processors
+# ---------------------------
+
+def process_sustain(y, sr,
+                    sustain_alpha=0.9,   # more floor (0..1)  higher = keep more original peaks
+                    gate_db=-50.0,       # relax gate threshold (less negative keeps more)
+                    floor_db=-40.0,      # level of floor vs full scale
+                    reverb_ms=0.0,       # optional reverb
+                    reverb_decay=0.35,
+                    reverb_mix=0.0):
+    """
+    Fill troughs using a coloured floor and optional reverb/echo.
+    """
+    # 1) Keep “content” segments; gate_db affects how much tail we keep
+    intervals = detect_intervals(y, sr, top_db=abs(gate_db))
+    core = concat_intervals(y, intervals)
+
+    # 2) Build coloured floor (snore-shaped) for the same duration
+    floor = build_coloured_noise_like(core, sr, secs=len(core)/sr)
+
+    # 3) Scale floor to a chosen dBFS
+    floor = floor * db_to_gain(floor_db)
+
+    # 4) Mix: sustain_alpha keeps core, (1 - alpha) adds floor
+    out = sustain_alpha * core + (1.0 - sustain_alpha) * floor
+
+    # 5) Optional reverb/echo to fill micro-gaps
+    if reverb_ms > 0.0 and reverb_mix > 0.0:
+        out = apply_reverb(out, sr, reverb_ms=reverb_ms, decay=reverb_decay, mix=reverb_mix)
+
+    return out.astype(np.float32, copy=False)
+
+# ---------------------------
+# Routes
+# ---------------------------
+
+@app.route('/')
 def home():
     return "SnoreEase processor is running"
 
-@app.route("/process", methods=["POST"])
+@app.route('/process', methods=['POST'])
 def process_audio():
-    if "file" not in request.files:
+    if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
-    f = request.files["file"]
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
 
-    # --------- memory-friendly defaults ---------
-    # Downsample to 22050 mono to keep memory small on Free
-    target_sr = 22050
-    # Absolute hard cap on processed duration (seconds)
-    hard_cap_sec = 210.0  # ~3.5 minutes
+    # Read bytes -> librosa
+    raw = f.read()
+    y, sr = librosa.load(io.BytesIO(raw), sr=None, mono=True)
 
-    # Load
-    try:
-        y, sr = librosa.load(io.BytesIO(f.read()), sr=target_sr, mono=True)
-    except Exception as e:
-        return jsonify({"error": f"Could not read audio: {e}"}), 400
+    # Common params (with defaults)
+    target_sec     = float(request.form.get('target_sec', 120))
+    xf_ms          = float(request.form.get('xf_ms', 300))
+    inter_fade_ms  = float(request.form.get('inter_fade_ms', 300))
+    normalize      = request.form.get('normalize', 'true').lower() == 'true'
+    target_dbfs    = float(request.form.get('target_dbfs', -18))
+    top_db         = float(request.form.get('top_db', 24))  # used only in “concat only” baseline
+    mode           = request.form.get('mode', 'sustain').lower()
 
-    # Soft length cap to avoid Render memory restarts
-    if len(y) > int(hard_cap_sec * target_sr):
-        y = y[: int(hard_cap_sec * target_sr)]
+    # Sustain-specific knobs
+    sustain_alpha  = float(request.form.get('sustain_alpha', 0.95))
+    gate_db        = float(request.form.get('gate_db', -50.0))        # less negative = fewer troughs
+    floor_db       = float(request.form.get('floor_db', -40.0))       # raise if you still hear dips
 
-    # Params
-    mode          = (request.form.get("mode") or "sustain").strip().lower()
-    normalize     = parse_bool(request.form.get("normalize"), True)
-    target_dbfs   = parse_float(request.form.get("target_dbfs"), -18.0)
+    # Reverb / echo
+    reverb_ms      = float(request.form.get('reverb_ms', 180.0))      # 0 to disable
+    reverb_decay   = float(request.form.get('reverb_decay', 0.35))
+    reverb_mix     = float(request.form.get('reverb_mix', 0.20))      # 0..1
 
-    # Bound target_sec so requests can’t push us over the hard cap
-    user_target_sec = parse_float(request.form.get("target_sec"), 120.0)
-    target_sec = min(user_target_sec, hard_cap_sec)
-
-    # Put back the bounded target_sec for processing functions
-    form = request.form.to_dict(flat=True)
-    form["target_sec"] = str(target_sec)
-
-    # Process by mode
-    if mode == "blend":
-        y_out = process_blend(y, sr, form)
-    elif mode == "morph":
-        y_out = process_morph(y, sr, form)
+    # --- Step A: create a continuous snore stream based on mode ---
+    if mode == 'sustain':
+        stream = process_sustain(y, sr,
+                                 sustain_alpha=sustain_alpha,
+                                 gate_db=gate_db,
+                                 floor_db=floor_db,
+                                 reverb_ms=reverb_ms,
+                                 reverb_decay=reverb_decay,
+                                 reverb_mix=reverb_mix)
     else:
-        # default to sustain if unknown
-        y_out = process_sustain(y, sr, form)
+        # Baseline: just keep non-silent parts
+        intervals = detect_intervals(y, sr, top_db=top_db)
+        stream = concat_intervals(y, intervals)
 
+    # --- Step B: Loop it nicely to the target length ---
+    stream = loop_to_seconds(stream, sr,
+                             target_sec=target_sec,
+                             xf_ms=xf_ms,
+                             inter_fade_ms=inter_fade_ms)
+
+    # --- Step C: Normalise if requested ---
     if normalize:
-        y_out = normalize_to_dbfs(y_out, target_dbfs=target_dbfs)
+        stream = normalise_to_dbfs(stream, target_dbfs=target_dbfs)
 
-    # Write to a BytesIO (avoid disk writes and keep it fast)
+    # Write to BytesIO to avoid disk churn
     buf = io.BytesIO()
-    sf.write(buf, y_out, samplerate=sr, format="WAV", subtype="PCM_16")
+    sf.write(buf, stream, sr, format='WAV', subtype='PCM_16')
     buf.seek(0)
+    return send_file(buf, mimetype='audio/wav',
+                     as_attachment=True, download_name='processed.wav')
 
-    return send_file(
-        buf,
-        mimetype="audio/wav",
-        as_attachment=True,
-        download_name="processed_snore.wav",
-    )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
